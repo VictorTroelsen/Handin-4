@@ -2,190 +2,238 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	pb "Handin-4/pb"
+
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
-type LamportClock struct {
-	mu   sync.Mutex
-	time int64
-}
+type State int
 
-func (lc *LamportClock) Increment() int64 {
-	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	lc.time++
-	return lc.time
-}
-
-func (lc *LamportClock) Update(received int64) int64 {
-	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	if received > lc.time {
-		lc.time = received
-	}
-	lc.time++
-	return lc.time
-}
-
-func (lc *LamportClock) Time() int64 {
-	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	return lc.time
-}
+const (
+	Released State = iota
+	Wanted
+	Held
+)
 
 type Node struct {
 	pb.UnimplementedRicartServer
 
-	id         string
-	port       string
-	peers      []string
-	clock      LamportClock
-	wantCS     bool
-	replyCount int
-	deferred   []string
-	mu         sync.Mutex
+	id    int
+	addr  string
+	peers map[int]string // id -> addr
+
+	// grpc
+	server  *grpc.Server
+	clients map[int]pb.RicartClient
+
+	// RA
+	mu      sync.Mutex
+	cv      *sync.Cond
+	state   State
+	clock   int64
+	wantTs  int64
+	waiters int // how many goroutines are currently blocked in RequestCS
 }
 
-func NewNode(id, port string, peers []string) *Node {
-	return &Node{
-		id:    id,
-		port:  port,
-		peers: peers,
+func NewNode(id int, addr string, peers map[int]string) *Node {
+	n := &Node{
+		id:      id,
+		addr:    addr,
+		peers:   peers,
+		clients: make(map[int]pb.RicartClient),
+		state:   Released,
+	}
+	n.cv = sync.NewCond(&n.mu)
+	return n
+}
+
+func (n *Node) tick() int64 { n.clock++; return n.clock }
+func (n *Node) update(ts int64) {
+	if ts >= n.clock {
+		n.clock = ts + 1
+	} else {
+		n.clock++
 	}
 }
+
+func (n *Node) StartGRPC() error {
+	lis, err := net.Listen("tcp", n.addr)
+	if err != nil {
+		return err
+	}
+	n.server = grpc.NewServer()
+	pb.RegisterRicartServer(n.server, n)
+	log.Printf("[N%d] listening on %s", n.id, n.addr)
+	go func() {
+		if err := n.server.Serve(lis); err != nil {
+			log.Fatalf("[N%d] grpc serve error: %v", n.id, err)
+		}
+	}()
+	return nil
+}
+
+func (n *Node) DialPeers() error {
+	for pid, paddr := range n.peers {
+		cc, err := grpc.Dial(paddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			return fmt.Errorf("dial %d @ %s: %w", pid, paddr, err)
+		}
+		n.clients[pid] = pb.NewRicartClient(cc)
+	}
+	return nil
+}
+
+// ---------------- RPCs (YOUR PROTO) ----------------
 
 func (n *Node) RequestCS(ctx context.Context, req *pb.Request) (*pb.Response, error) {
+	fromID, _ := strconv.Atoi(strings.TrimSpace(req.GetMessage()))
 	n.mu.Lock()
-	defer n.mu.Unlock()
+	n.update(req.GetTimestamp())
+	myClockNow := n.clock
 
-	n.clock.Update(req.Timestamp)
-	log.Printf("[NODE %s] Received Request from %s (ts=%d)", n.id, req.Message, req.Timestamp)
+	log.Printf("[N%d t=%d] <- REQUEST from N%d(t=%d)", n.id, myClockNow, fromID, req.GetTimestamp())
 
-	shouldDefer := n.wantCS && (req.Timestamp > n.clock.Time() ||
-		(req.Timestamp == n.clock.Time() && req.Message > n.id))
+	// Decide whether to grant now or defer by blocking the handler.
+	for {
+		grant := false
+		switch n.state {
+		case Released:
+			grant = true
+		case Held:
+			grant = false
+		case Wanted:
+			// Compare (my.wantTs, my.id) vs (req.ts, fromID)
+			if n.wantTs > req.GetTimestamp() {
+				grant = true
+			} else if n.wantTs == req.GetTimestamp() && n.id > fromID {
+				grant = true
+			} else {
+				grant = false
+			}
+		}
 
-	if shouldDefer {
-		log.Printf("[NODE %s] Deferring reply to %s", n.id, req.Message)
-		n.deferred = append(n.deferred, req.Message)
-		return &pb.Response{Granted: false, NodeId: n.id}, nil
+		if grant {
+			n.tick() // sending a logical event
+			n.mu.Unlock()
+			return &pb.Response{Granted: true, NodeId: strconv.Itoa(n.id)}, nil
+		}
+
+		// Defer: wait until our state changes (Release wakes us).
+		n.waiters++
+		n.cv.Wait()
+		n.waiters--
+		// loop and re-evaluate
 	}
-
-	log.Printf("[NODE %s] Granting reply to %s", n.id, req.Message)
-	return &pb.Response{Granted: true, NodeId: n.id}, nil
 }
 
 func (n *Node) ReleaseCS(ctx context.Context, rel *pb.Release) (*pb.Response, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	log.Printf("[NODE %s] Received Release from %s", n.id, rel.NodeId)
-
-	for _, d := range n.deferred {
-		go n.sendReply(d)
-	}
-	n.deferred = nil
-	return &pb.Response{Granted: true, NodeId: n.id}, nil
+	// Not strictly needed for correctness in this blocking design,
+	// but we keep it for logging/completeness.
+	log.Printf("[N%d] <- RELEASE notice from N%s", n.id, rel.GetNodeId())
+	return &pb.Response{Granted: true, NodeId: strconv.Itoa(n.id)}, nil
 }
 
-func (n *Node) sendReply(target string) {
-	conn, err := grpc.Dial(target, grpc.WithInsecure())
-	if err != nil {
-		log.Printf("[NODE %s] Failed to dial %s: %v", n.id, target, err)
-		return
-	}
-	defer conn.Close()
-
-	client := pb.NewRicartClient(conn)
-	_, err = client.RequestCS(context.Background(), &pb.Request{
-		Message:   n.id,
-		Timestamp: n.clock.Increment(),
-	})
-	if err != nil {
-		log.Printf("[NODE %s] Error sending deferred reply to %s: %v", n.id, target, err)
-	}
-}
+// ---------------- Node-side RA API ----------------
 
 func (n *Node) RequestCriticalSection() {
 	n.mu.Lock()
-	n.wantCS = true
-	n.replyCount = 0
-	ts := n.clock.Increment()
+	n.state = Wanted
+	n.wantTs = n.tick()
+	ts := n.wantTs
 	n.mu.Unlock()
 
-	log.Printf("[NODE %s] Requesting CS at Lamport=%d", n.id, ts)
+	log.Printf("[N%d t=%d] broadcasting REQUEST to %d peers", n.id, ts, len(n.peers))
 
-	for _, peer := range n.peers {
-		go func(peer string) {
-			conn, err := grpc.Dial(peer, grpc.WithInsecure())
-			if err != nil {
-				log.Printf("[NODE %s] Failed to dial peer %s: %v", n.id, peer, err)
-				return
-			}
-			defer conn.Close()
+	// Ask all peers; all must grant.
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(n.peers))
 
-			client := pb.NewRicartClient(conn)
-			resp, err := client.RequestCS(context.Background(), &pb.Request{
-				Message:   n.id,
+	for pid, c := range n.clients {
+		wg.Add(1)
+		go func(pid int, c pb.RicartClient) {
+			defer wg.Done()
+			_, err := c.RequestCS(context.Background(), &pb.Request{
+				Message:   strconv.Itoa(n.id),
 				Timestamp: ts,
 			})
 			if err != nil {
-				log.Printf("[NODE %s] Error contacting %s: %v", n.id, peer, err)
-				return
+				errCh <- fmt.Errorf("peer %d: %w", pid, err)
 			}
-
-			if resp.Granted {
-				n.mu.Lock()
-				n.replyCount++
-				n.mu.Unlock()
-				log.Printf("[NODE %s] Received granted reply from %s", n.id, peer)
-			} else {
-				log.Printf("[NODE %s] Received denied reply from %s", n.id, peer)
-			}
-		}(peer)
+		}(pid, c)
 	}
-}
-
-func (n *Node) WaitForCS() {
-	for {
-		n.mu.Lock()
-		done := n.replyCount == len(n.peers)
-		n.mu.Unlock()
-		if done {
-			break
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			log.Printf("[N%d] error waiting replies: %v", n.id, err)
 		}
-		time.Sleep(200 * time.Millisecond)
 	}
-	log.Printf("[NODE %s] ENTERED critical section", n.id)
-	time.Sleep(2 * time.Second)
-	n.ReleaseCriticalSection()
+
+	n.mu.Lock()
+	n.state = Held
+	now := n.tick()
+	n.mu.Unlock()
+	log.Printf("[N%d t=%d] >>> ENTER CS", n.id, now)
 }
 
 func (n *Node) ReleaseCriticalSection() {
 	n.mu.Lock()
-	n.wantCS = false
+	if n.state != Held {
+		n.mu.Unlock()
+		return
+	}
+	n.state = Released
+	now := n.tick()
+	// Wake any deferred request handlers.
+	n.cv.Broadcast()
+	w := n.waiters
 	n.mu.Unlock()
 
-	log.Printf("[NODE %s] Releasing critical section", n.id)
+	log.Printf("[N%d t=%d] <<< EXIT CS; woke %d waiter(s)", n.id, now, w)
 
-	for _, peer := range n.peers {
-		go func(peer string) {
-			conn, err := grpc.Dial(peer, grpc.WithInsecure())
-			if err != nil {
-				log.Printf("[NODE %s] Failed to dial peer %s: %v", n.id, peer, err)
-				return
-			}
-			defer conn.Close()
-
-			client := pb.NewRicartClient(conn)
-			_, err = client.ReleaseCS(context.Background(), &pb.Release{NodeId: n.id})
-			if err != nil {
-				log.Printf("[NODE %s] Error sending release to %s: %v", n.id, peer, err)
-			}
-		}(peer)
+	// Optional: notify peers (matches your proto but not required)
+	for pid, c := range n.clients {
+		go func(pid int, c pb.RicartClient) {
+			_, _ = c.ReleaseCS(context.Background(), &pb.Release{NodeId: strconv.Itoa(n.id)})
+		}(pid, c)
 	}
+}
+
+func (n *Node) SimulateCriticalSection(work time.Duration) {
+	n.RequestCriticalSection()
+	log.Printf("[N%d] [CS] doing sensitive work...", n.id)
+	time.Sleep(work)
+	n.ReleaseCriticalSection()
+}
+
+// Parse peers flag like: "1=127.0.0.1:5001,2=127.0.0.1:5002,3=127.0.0.1:5003"
+func parsePeers(flag string, selfID int, selfAddr string) map[int]string {
+	out := map[int]string{}
+	parts := strings.Split(flag, ",")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		var id int
+		var addr string
+		if _, err := fmt.Sscanf(p, "%d=%s", &id, &addr); err != nil {
+			log.Fatalf("bad peers entry %q: %v", p, err)
+		}
+		if id == selfID {
+			addr = selfAddr
+		}
+		out[id] = addr
+	}
+	delete(out, selfID)
+	return out
 }
