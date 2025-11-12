@@ -1,53 +1,38 @@
 package main
 
 import (
-	"fmt"
+	"flag"
 	"log"
-	"net"
-	"os"
-	"strings"
 	"time"
-
-	pb "Handin-4/pb"
-	"google.golang.org/grpc"
 )
 
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Println("Usage: go run main.go <node_id> <port> <peer1,peer2,...>")
-		os.Exit(1)
+	id := flag.Int("id", 1, "node id")
+	addr := flag.String("addr", "127.0.0.1:5001", "listen addr")
+	peers := flag.String("peers", "1=127.0.0.1:5001,2=127.0.0.1:5002,3=127.0.0.1:5003", "comma list id=addr")
+	auto := flag.Bool("auto", true, "auto demo")
+	flag.Parse()
+
+	peerMap := parsePeers(*peers, *id, *addr)
+	n := NewNode(*id, *addr, peerMap)
+
+	if err := n.StartGRPC(); err != nil {
+		log.Fatalf("start grpc: %v", err)
 	}
-
-	nodeID := os.Args[1]
-	port := os.Args[2]
-	var peers []string
-	if len(os.Args) >= 4 {
-		peers = strings.Split(os.Args[3], ",")
+	if err := n.DialPeers(); err != nil {
+		log.Fatalf("dial peers: %v", err)
 	}
+	log.Printf("[N%d] peers: %+v", *id, peerMap)
 
-	node := NewNode(nodeID, port, peers)
-
-	// Start gRPC server
-	go func() {
-		lis, err := net.Listen("tcp", ":"+port)
-		if err != nil {
-			log.Fatalf("failed to listen: %v", err)
+	if *auto {
+		// Run forever with a little stagger so logs interleave nicely
+		for {
+			// jitter so nodes don’t always collide the same way
+			time.Sleep(time.Duration(400+150*(*id)) * time.Millisecond)
+			n.SimulateCriticalSection(800 * time.Millisecond)
+			time.Sleep(300 * time.Millisecond)
 		}
-		s := grpc.NewServer()
-		pb.RegisterRicartServer(s, node)
-		log.Printf("[%s] Listening on port %s", nodeID, port)
-		if err := s.Serve(lis); err != nil {
-			log.Fatalf("failed to serve: %v", err)
-		}
-	}()
-
-	// Give time for all nodes to start
-	time.Sleep(2 * time.Second)
-
-	// Periodically attempt to enter CS
-	for {
-		node.RequestCriticalSection()
-		node.WaitForCS()
-		time.Sleep(5 * time.Second)
 	}
+
+	select {}
 }
